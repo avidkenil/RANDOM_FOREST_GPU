@@ -6,6 +6,7 @@ LEFT_KEY = 2
 RIGHT_KEY = 3
 PRED_KEY = 4
 DEPTH_KEY = 5
+
 NUM_FIELDS = 6
 
 
@@ -49,6 +50,10 @@ class FlexArray:
         return self._max_key
 
     @property
+    def full_length(self):
+        return self._data.shape[1]
+
+    @property
     def data(self):
         return self._data
 
@@ -60,9 +65,9 @@ class Tree(object):
     def __init__(self, k=None):
         self.k = k
         self.data_arr = None
-        self.max_depth = 0
         self.length = 1
-        self.fit_stack = None
+        self._x = None
+        self._y = None
 
     def fit(self, x, y):
         initial_size = int(np.ceil(np.log2(len(x))))
@@ -71,25 +76,29 @@ class Tree(object):
         self.data_arr = FlexArray(
             num_fields=NUM_FIELDS, n=initial_size, default_value=-1,
         )
-        self.fit_stack = []
-        self._fit_tree(
-            x, y,
-            prev_valid_feat_ls=range(x.shape[1]),
-            pos=0,
-            depth=0,
-        )
 
-    def _fit_tree(self, x, y, prev_valid_feat_ls, pos, depth):
+        self.data_arr[LEFT_KEY, 0] = 0
+        self.data_arr[RIGHT_KEY, 0] = 0
+        self.data_arr[DEPTH_KEY, 0] = 0
 
-        # Hack for python performance.
-        self.data_arr[LEFT_KEY, pos] = pos
-        self.data_arr[RIGHT_KEY, pos] = pos
-        # End hack
+        self._x = x
+        self._y = y
 
-        if depth > self.max_depth:
-            self.max_depth = depth
+        curr_depth = 0
+        while np.any(self.data_arr.get_column(DEPTH_KEY) == curr_depth):
+            batch_pos = self._batch_traverse_tree(self._x)
+            pos_candidates = np.arange(self.data_arr.full_length)[
+                self.data_arr.get_column(DEPTH_KEY) == curr_depth
+            ]
+            for pos in pos_candidates:
+                node_filter = batch_pos == pos
+                self._fit_tree(node_filter, pos)
+            curr_depth += 1
 
-        self.data_arr[DEPTH_KEY, pos] = depth
+    def _fit_tree(self, node_filter, pos):
+        x = self._x[node_filter]
+        y = self._y[node_filter]
+
         if len(x) == 1:
             self.data_arr[PRED_KEY, pos] = y[0]
             return
@@ -101,7 +110,7 @@ class Tree(object):
         valid_feat_ls = []
         min_feat_x = np.min(x, axis=0)
         max_feat_x = np.max(x, axis=0)
-        for feat in prev_valid_feat_ls:
+        for feat in np.arange(x.shape[1]):
             if min_feat_x[feat] != max_feat_x[feat]:
                 valid_feat_min_max.append(
                     (feat, min_feat_x[feat], max_feat_x[feat]))
@@ -112,7 +121,7 @@ class Tree(object):
 
         chosen_feat = [
             valid_feat_min_max[_] for _ in
-            np.random.choice(np.arange(len(valid_feat_ls)), replace=False,
+            np.random.choice(np.arange(len(valid_feat_ls)), replace=True,
                              size=min(self.k, len(valid_feat_ls)))
         ]
 
@@ -120,7 +129,6 @@ class Tree(object):
         best_improvement = -np.inf
         best_feat = None
         best_cut = None
-        best_x_filtered = None
         for feat, feat_min, feat_max in chosen_feat:
             cut_point = np.random.uniform(feat_min, feat_max)
             x_filtered = x[:, feat] < cut_point
@@ -140,11 +148,6 @@ class Tree(object):
                 best_feat = feat
                 best_cut = cut_point
                 best_improvement = proxy_improvement
-                best_x_filtered = x_filtered
-
-        x_filtered = best_x_filtered
-        left_x, left_y = x[x_filtered], y[x_filtered]
-        right_x, right_y = x[~x_filtered], y[~x_filtered]
 
         self.data_arr[FEAT_KEY, pos] = best_feat
         self.data_arr[CUT_KEY, pos] = best_cut
@@ -153,15 +156,21 @@ class Tree(object):
         right_pos = self.length + 1
         self.length += 2
 
-        self._fit_tree(left_x, left_y, valid_feat_ls, pos=left_pos,
-                       depth=depth + 1)
         self.data_arr[LEFT_KEY, pos] = left_pos
-
-        self._fit_tree(right_x, right_y, valid_feat_ls, pos=right_pos,
-                       depth=depth + 1)
         self.data_arr[RIGHT_KEY, pos] = right_pos
 
-    def batch_predict(self, x):
+        # Hack for python performance to terminate traversal
+        depth = self.data_arr[DEPTH_KEY, pos]
+        self.data_arr[LEFT_KEY, left_pos] = left_pos
+        self.data_arr[DEPTH_KEY, left_pos] = depth + 1
+        self.data_arr[RIGHT_KEY, left_pos] = left_pos
+
+        self.data_arr[LEFT_KEY, right_pos] = right_pos
+        self.data_arr[RIGHT_KEY, right_pos] = right_pos
+        self.data_arr[DEPTH_KEY, right_pos] = depth + 1
+        # End hack
+
+    def predict(self, x):
         pos = self._batch_traverse_tree(x)
         return self.data_arr.data[PRED_KEY, pos].astype(int)
 
@@ -188,19 +197,3 @@ class Tree(object):
             if depth_counter > 100000:
                 raise Exception
         return pos
-
-    def predict(self, x):
-        return np.array([
-            self.predict_with_tree(x_row)
-            for x_row in x
-        ])
-
-    def predict_with_tree(self, x_row):
-        feat_arr = self.data_arr.get_column(FEAT_KEY).astype(int)
-        pos = 0
-        while self.data_arr[PRED_KEY, pos] == -1:
-            if x_row[feat_arr[pos]] < self.data_arr[CUT_KEY, pos]:
-                pos = int(self.data_arr[LEFT_KEY, pos])
-            else:
-                pos = int(self.data_arr[RIGHT_KEY, pos])
-        return self.data_arr[PRED_KEY, pos]
