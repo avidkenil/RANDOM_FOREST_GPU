@@ -115,7 +115,7 @@ void collect_min_max(float* x, int* batch_pos, int desired_pos, float* min_max_b
 	int x_i, feat_i;
 	for(feat_i=0; feat_i < FEATURE; feat_i++){
 		minimum = FLT_MAX;
-		maximum = FLT_MIN;
+		maximum = -FLT_MAX;
 		for(x_i=0; x_i<TRAIN_NUM; x_i++){
 			if(batch_pos[x_i] != desired_pos){
 				continue;
@@ -133,11 +133,11 @@ void collect_min_max(float* x, int* batch_pos, int desired_pos, float* min_max_b
 	}
 }
 
-int unif(int low, int high){
+int int_unif(int low, int high){
 	return low + ((int) rand()) % (high - low);
 }
 
-float unif(float low, float high){
+float float_unif(float low, float high){
 	return (high - low) * ((float)rand() / RAND_MAX) + low;
 }
 
@@ -168,7 +168,7 @@ void populate_random_feat_cuts(float* min_max_buffer, int num_valid_feats, int f
 
 	for(i=0; i<feat_per_node; i++){
 		// Overloading. First using random_cuts to store indices.
-		random_feats[i] = unif(0, num_valid_feats);
+		random_feats[i] = int_unif(0, num_valid_feats);
 	}
 	qsort(random_feats, feat_per_node, sizeof(int), int_cmp);
 	valid_seen = 0;
@@ -182,7 +182,7 @@ void populate_random_feat_cuts(float* min_max_buffer, int num_valid_feats, int f
 			}
 		}
 		random_feats[i] = feat_i;
-		random_cuts[i] = unif(
+		random_cuts[i] = float_unif(
 			min_max_buffer[index(feat_i, 0, 2)], min_max_buffer[index(feat_i, 1, 2)]
 		);
 	}
@@ -199,7 +199,7 @@ void place_best_feat_cuts(
 	int total_a, total_b;
 	float impurity_a, impurity_b;
 
-	best_improvement = FLT_MIN;
+	best_improvement = -FLT_MAX;
 	best_feat = -1;
 	best_cut = 0;
 	for(feat_i=0; feat_i<feat_per_node; feat_i++){
@@ -255,8 +255,28 @@ float terminate_node(float* y, int* batch_pos, int pos){
 			}
 		}
 	}
-	// Should never return -1 here. We should see at least 1 y.
 	return y_token;
+}
+
+float get_mode(int* batch_pos, int tree_pos, float* y, int* class_counts){
+	int i, maximum_count, maximum_class;
+	for(i=0; i<NUMBER_OF_CLASSES; i++){
+		class_counts[i] = 0;
+	}
+	for(i=0; i<TRAIN_NUM; i++){
+		if(batch_pos[i] == tree_pos){
+			class_counts[(int) y[i]]++;
+		}
+	}
+	maximum_count = -1; 
+	maximum_class = -1;
+	for(i=0; i<NUMBER_OF_CLASSES; i++){
+		if(class_counts[i] > maximum_count){
+			maximum_count = class_counts[i];
+			maximum_class = i;
+		}
+	}
+	return maximum_class;
 }
 
 int grow_tree(
@@ -264,10 +284,18 @@ int grow_tree(
 		int tree_pos, float* tree, int* tree_length,
 		int* batch_pos, float* min_max_buffer, 
 		int feat_per_node, int* random_feats, float* random_cuts,
-		int* class_counts_a, int* class_counts_b
+		int* class_counts_a, int* class_counts_b,
+		int max_depth
 	){
 	float early_termination;
 	int num_valid_feats;
+
+	if(tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)] == max_depth){
+		tree[index(tree_pos, PRED_KEY, NUM_FIELDS)] = get_mode(
+			batch_pos, tree_pos, y, class_counts_a
+		);
+		return 0;
+	}
 
 	early_termination = terminate_node(y, batch_pos, tree_pos);
 	if(early_termination != -1){
@@ -318,7 +346,6 @@ float calc_accuracy(float* tree, float* x, float* y, int x_length, int* batch_po
 	correct = 0;
 	for(i=0; i<x_length; i++){
 		pred = (int) tree[index(batch_pos[i], PRED_KEY, NUM_FIELDS)];
-		//printf("%d %d\n", i, pred);
 		if(pred == (int) y[i]){
 			correct++;
 		}
@@ -352,7 +379,7 @@ int main(int argc, char * argv[])
 	int *random_feats;
 	float *random_cuts;
 	int *class_counts_a, *class_counts_b;
-	int prev_depth;
+	int prev_depth, max_depth;
 
 	srand(1);
 
@@ -386,11 +413,15 @@ int main(int argc, char * argv[])
 	printf("%d\n", *tree_arr_length);
 	*/
 
-
+	max_depth = 1000;
 
 	prev_depth = -1;
 	for(tree_pos=0; tree_pos<*tree_length; tree_pos++){
+	//for(tree_pos=0; tree_pos<8; tree_pos++){
 		printf("%d (depth=%f)\n", tree_pos, tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)]);
+		if(tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)] > max_depth){
+			break;
+		}
 		if(prev_depth!=tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)]){
 			prev_depth = tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)];
 			batch_traverse_tree(tree, dataset_train, TRAIN_NUM, batch_pos);
@@ -400,7 +431,8 @@ int main(int argc, char * argv[])
 			tree_pos, tree, tree_length,
 			batch_pos, min_max_buffer, 
 			feat_per_node, random_feats, random_cuts,
-			class_counts_a, class_counts_b
+			class_counts_a, class_counts_b,
+			max_depth
 		);
 		tree = maybe_expand(tree, tree_arr_length, *tree_length);
 	}
