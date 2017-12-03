@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 //#define MAX_FILE_NAME 100
+#define TRAIN_NUM 120
+#define TEST_NUM 30
+#define FEATURE 4
+#define NUMBER_OF_CLASSES 3
  
 int countNumRows(char *filename)
 {
@@ -56,10 +60,10 @@ Iris-versicolor - 1
 Iris-virginica - 2
 
 */
-void read_csv_iris(float *data, int *label, int row_count, char *filename)
+void read_csv_iris(float *data, float *label, int row_count, char *filename)
 {
-    data = (float *)malloc(row_count*4*sizeof(float));
-    label = (int *)malloc(row_count*sizeof(int));
+    //data = (float *)malloc(row_count*4*sizeof(float));
+    //label = (int *)malloc(row_count*sizeof(int));
     FILE *fp = fopen(filename,"r");
     char line[1024];
     int count = 0;
@@ -95,6 +99,7 @@ void read_csv_iris(float *data, int *label, int row_count, char *filename)
             data[idx*4 + i] = temp_num;
         }
         idx++;
+        
     }
 
 
@@ -104,11 +109,16 @@ void read_csv_iris(float *data, int *label, int row_count, char *filename)
 int main(int argc,char *argv[])
 {
     int count;
-    char iris_filename[] = "data/iris.data";
-    count = countNumRows(iris_filename);
-    float *data;
-    int *label;
-    read_csv_iris(data,label,count,iris_filename);
+    float *dataset_train,*dataset_test;
+    float *labels_train,*labels_test;
+    dataset_train = (float *)malloc(FEATURE * TRAIN_NUM*sizeof(float));
+    labels_train = (float *)malloc(TRAIN_NUM*sizeof(float));
+    dataset_test = (float *)malloc(FEATURE * TEST_NUM*sizeof(float));
+    labels_test = (float *)malloc(TEST_NUM*sizeof(float));
+    char file_train_set[] = "data/iris_train.data";
+    char file_test_set[] = "data/iris_test.data";
+    read_csv_iris(dataset_train,labels_train,TRAIN_NUM,file_train_set);
+    read_csv_iris(dataset_test,labels_test,TEST_NUM,file_test_set);
     
     return 0;
 }
