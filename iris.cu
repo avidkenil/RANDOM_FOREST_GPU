@@ -192,14 +192,14 @@ float* maybe_expand(float* d_trees, int num_trees, int* tree_arr_length, int* d_
 }
 
 /* === Tree Initialization === */
-__global__ void kernel_initialize_trees(float *d_trees, int* d_tree_lengths){
-	d_trees[ixt(0, LEFT_KEY, threadIdx.x, NUM_FIELDS, blockIdx.x)] = 0;
-	d_trees[ixt(0, RIGHT_KEY, threadIdx.x, NUM_FIELDS, blockIdx.x)] = 0;
-	d_trees[ixt(0, DEPTH_KEY, threadIdx.x, NUM_FIELDS, blockIdx.x)] = 0;
+__global__ void kernel_initialize_trees(float *d_trees, int* d_tree_lengths, int tree_arr_length){
+	d_trees[ixt(0, LEFT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = 0;
+	d_trees[ixt(0, RIGHT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = 0;
+	d_trees[ixt(0, DEPTH_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = 0;
 	d_tree_lengths[threadIdx.x] = 1;
 }
-void initialize_trees(float* d_trees, int num_trees, int* d_tree_lengths){
-	kernel_initialize_trees<<<1, num_trees>>>(d_trees, d_tree_lengths);
+void initialize_trees(float* d_trees, int num_trees, int tree_arr_length, int* d_tree_lengths){
+	kernel_initialize_trees<<<1, num_trees>>>(d_trees, d_tree_lengths, tree_arr_length);
 }
 __global__ void kernel_initialize_batch_pos(int *d_batch_pos, int x_length, int num_trees){
 	int i;
@@ -228,13 +228,13 @@ __global__ void kernel_traverse_trees(float *d_trees, float* d_x, int x_length, 
 	x_i = x_i / num_trees;
 	pos = 0;
     while(1){
-        if(d_x[index(x_i, (int) d_trees[ixt(pos, FEAT_KEY, tree_id, NUM_FIELDS, num_trees)], FEATURE)] < 
-        		d_trees[ixt(pos, CUT_KEY, tree_id, NUM_FIELDS, num_trees)]){
+        if(d_x[index(x_i, (int) d_trees[ixt(pos, FEAT_KEY, tree_id, NUM_FIELDS, TRAIN_NUM)], FEATURE)] < 
+        		d_trees[ixt(pos, CUT_KEY, tree_id, NUM_FIELDS, TRAIN_NUM)]){
             left_right_key = LEFT_KEY;
         }else{
             left_right_key = RIGHT_KEY;
         }
-        new_pos = (int) d_trees[ixt(pos, left_right_key, tree_id, NUM_FIELDS, num_trees)];
+        new_pos = (int) d_trees[ixt(pos, left_right_key, tree_id, NUM_FIELDS, TRAIN_NUM)];
         if(new_pos == pos){
             // Leaf nodes are set up to be idempotent
             break;
@@ -249,24 +249,24 @@ void batch_traverse_trees(float *d_tree, float *d_x, int x_length, int num_trees
  	num_blocks = ceil(num_trees * x_length/((float) block_size));
 	kernel_traverse_trees<<<num_blocks, block_size>>>(d_tree, d_x, x_length, num_trees, d_batch_pos);
 }
-__global__ void kernel_advance_trees(float *d_trees, float* d_x, int x_length, int num_trees, int* d_batch_pos){
+__global__ void kernel_advance_trees(float *d_trees, float* d_x, int x_length, int tree_arr_length, int num_trees, int* d_batch_pos){
 	int pos, left_right_key, x_i;
 	// threadIdx.x = x_i, blockIdx.x = tree_id
 	for(x_i=threadIdx.x; x_i < x_length; x_i+=blockDim.x){
 		pos = d_batch_pos[x_i];
-	    if(d_x[index(x_i, (int) d_trees[ixt(pos, FEAT_KEY, blockIdx.x, NUM_FIELDS, num_trees)], FEATURE)] < 
-	    		d_trees[ixt(pos, CUT_KEY, blockIdx.x, NUM_FIELDS, num_trees)]){
+	    if(d_x[index(x_i, (int) d_trees[ixt(pos, FEAT_KEY, blockIdx.x, NUM_FIELDS, tree_arr_length)], FEATURE)] < 
+	    		d_trees[ixt(pos, CUT_KEY, blockIdx.x, NUM_FIELDS, tree_arr_length)]){
 	        left_right_key = LEFT_KEY;
 	    }else{
 	        left_right_key = RIGHT_KEY;
 	    }
-	    d_batch_pos[x_i] = (int) d_trees[ixt(pos, left_right_key, blockIdx.x, NUM_FIELDS, num_trees)];
+	    d_batch_pos[x_i] = (int) d_trees[ixt(pos, left_right_key, blockIdx.x, NUM_FIELDS, tree_arr_length)];
 	}
 }
-void batch_advance_trees(float *d_tree, float *d_x, int x_length, int num_trees, int *d_batch_pos, 
+void batch_advance_trees(float *d_tree, float *d_x, int x_length, int tree_arr_length, int num_trees, int *d_batch_pos, 
 						 cudaDeviceProp dev_prop){
 	kernel_advance_trees<<<num_trees, dev_prop.maxThreadsPerBlock>>>(
-		d_tree, d_x, x_length, num_trees, d_batch_pos
+		d_tree, d_x, x_length, tree_arr_length, num_trees, d_batch_pos
 	);
 }
 
@@ -306,10 +306,10 @@ __global__ void kernel_collect_min_max(float* d_x, int* d_batch_pos, int desired
 			}
 		}
 	}
-
 	if(threadIdx.x==0){
-		d_min_max_buffer[ixt(blockIdx.y, 0, blockIdx.x, 2, num_trees)] = shared_min_max[index(0, 0, 2)];
-		d_min_max_buffer[ixt(blockIdx.y, 1, blockIdx.x, 2, num_trees)] = shared_min_max[index(0, 1, 2)];
+		d_min_max_buffer[ixt(blockIdx.y, 0, blockIdx.x, 2, FEATURE)] = shared_min_max[index(0, 0, 2)];
+		d_min_max_buffer[ixt(blockIdx.y, 1, blockIdx.x, 2, FEATURE)] = shared_min_max[index(0, 1, 2)];
+		
 	}
 }
 void collect_min_max(float* d_x, int* d_batch_pos, int desired_pos, int num_trees, int x_length,
@@ -326,14 +326,13 @@ __global__ void kernel_collect_num_valid_feat(int* d_num_valid_feat, float* d_mi
 	int sub_num_valid_feat, feat_i;
 	sub_num_valid_feat = 0;
 	for(feat_i=threadIdx.x; feat_i<FEATURE; feat_i+=blockDim.x){
-		if(d_min_max_buffer[ixt(feat_i, 0, blockIdx.x, 2, num_trees)] != 
-			d_min_max_buffer[ixt(feat_i, 1, blockIdx.x, 2, num_trees)]
+		if(d_min_max_buffer[ixt(feat_i, 0, blockIdx.x, 2, FEATURE)] != 
+			d_min_max_buffer[ixt(feat_i, 1, blockIdx.x, 2, FEATURE)]
 			){
 			sub_num_valid_feat++;
 		}
 	}
 	shared_num_valid_feat_buffer[threadIdx.x] = sub_num_valid_feat;
-	
 	for(int stride=blockDim.x/2; stride > 0; stride >>=1){
 		__syncthreads();
 		if(threadIdx.x < stride){
@@ -347,7 +346,7 @@ __global__ void kernel_collect_num_valid_feat(int* d_num_valid_feat, float* d_mi
 void collect_num_valid_feat(int* d_num_valid_feat, float* d_min_max_buffer, int num_trees, cudaDeviceProp dev_prop){
 	// Ripe for optimization
 	int block_size = MIN(dev_prop.maxThreadsPerBlock, next_pow_2(FEATURE)); // Copy this to other places too
-	kernel_collect_num_valid_feat<<<num_trees, block_size, block_size>>>(
+	kernel_collect_num_valid_feat<<<num_trees, block_size, block_size * sizeof(int)>>>(
 		d_num_valid_feat, d_min_max_buffer, num_trees
 	);
 }
@@ -365,7 +364,6 @@ int main(int argc,char *argv[])
 	read_csv_iris(dataset_train,labels_train,TRAIN_NUM,file_train_set);
 	read_csv_iris(dataset_test,labels_test,TEST_NUM,file_test_set);
 	
-
 	float *trees, *d_trees;
 	int *tree_arr_length;
 	int *tree_lengths, *d_tree_lengths;
@@ -383,7 +381,7 @@ int main(int argc,char *argv[])
 	float *d_x, *d_y;
 
 	int num_trees;
-	num_trees = 200;
+	num_trees = 5;
 	// Assumption: num_trees < maxNumBlocks, maxThreadsPerBlock
 	printf("num_trees %d\n", num_trees);
 	srand(2);
@@ -423,70 +421,22 @@ int main(int argc,char *argv[])
 	cudaMemcpy(d_y, labels_train, TRAIN_NUM *sizeof(float), cudaMemcpyHostToDevice);
 
 	tree_pos = 0;
-	initialize_trees(d_trees, num_trees, d_tree_lengths);
+	initialize_trees(d_trees, num_trees, *tree_arr_length, d_tree_lengths);
 	maybe_expand(d_trees, num_trees, tree_arr_length, d_tree_lengths, max_tree_length, d_max_tree_length);
+
 	//batch_traverse_trees(d_trees, d_x, TRAIN_NUM, num_trees, d_batch_pos, dev_prop);
 	initialize_batch_pos(d_batch_pos, TRAIN_NUM, num_trees, dev_prop);
-	batch_advance_trees(d_trees, d_x, TRAIN_NUM, num_trees, d_batch_pos, dev_prop);
-	cudaMemcpy(batch_pos, d_batch_pos, num_trees * TRAIN_NUM * sizeof(int), cudaMemcpyDeviceToHost);
-
+	batch_advance_trees(d_trees, d_x, TRAIN_NUM, *tree_arr_length, num_trees, d_batch_pos, dev_prop);
 	collect_min_max(d_x, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
 					d_min_max_buffer, dev_prop);
 	collect_num_valid_feat(
 		d_num_valid_feat, d_min_max_buffer, num_trees, dev_prop
 	);
-
-	cudaMemcpy(min_max_buffer, d_min_max_buffer, num_trees * FEATURE * 2 *sizeof(float), cudaMemcpyDeviceToHost);
-	for(int i=0; i<FEATURE; i++){
-		printf("%f %f\n", min_max_buffer[ixt(i, 0, 0, 2, num_trees)], 
-			              min_max_buffer[ixt(i, 1, 0, 2, num_trees)]);
-	}
 	cudaMemcpy(num_valid_feat, d_num_valid_feat, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
+	printf("\n");
 	for(int i=0; i<num_trees; i++){
 		printf("%d ", num_valid_feat[i]);
 	}
 	printf("\n");
-
 	debug(0);
-
-	/*
-	for(int i=0; i<TRAIN_NUM; i++){
-		printf("%d=%f\n", i, dataset_train[index(i, 0, FEATURE)]);
-	}
-	*/
-
-
-	max_depth = 4;
-
-	/*
-	prev_depth = -1;
-	for(tree_pos=0; tree_pos<*tree_length; tree_pos++){
-		printf("%d (depth=%f)\n", tree_pos, tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)]);
-		if(tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)] > max_depth){
-			break;
-		}
-		if(prev_depth!=tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)]){
-			prev_depth = tree[index(tree_pos, DEPTH_KEY, NUM_FIELDS)];
-			batch_traverse_tree(tree, dataset_train, TRAIN_NUM, batch_pos);
-		}
-		grow_tree(
-			dataset_train, labels_train,
-			tree_pos, tree, tree_length,
-			batch_pos, min_max_buffer, 
-			feat_per_node, random_feats, random_cuts,
-			class_counts_a, class_counts_b,
-			max_depth
-		);
-		tree = maybe_expand(tree, tree_arr_length, *tree_length);
-	}
-
-
-	printf("Train Accuracy %f\n", calc_accuracy(
-		tree, dataset_train, labels_train, TRAIN_NUM, batch_pos
-	));
-	printf("Test Accuracy %f\n", calc_accuracy(
-		tree, dataset_test, labels_test, TEST_NUM, batch_pos
-	));
-	*/
-	return 0;
 }
