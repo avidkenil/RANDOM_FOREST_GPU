@@ -23,6 +23,8 @@
 
 #define index(i, j, N)  ((i)*(N)) + (j)
 #define ixt(i, j, t, N, T) ((t)*(N)*(T)) + ((i)*(N)) + (j)
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#define MAX(a,b) (((a)>(b))?(a):(b))
  
 int countNumRows(char *filename)
 {
@@ -128,6 +130,10 @@ void debug(int i){
 		printf("%d Cuda failure %s:%d: '%s'\n", i, __FILE__,__LINE__,cudaGetErrorString(e));    
 	}
 }
+__global__ void init_random_generator(curandState *state){
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	curand_init(1337, idx, 0, &state[idx]);
+}
 
 /* === Expanding tree memory === */
 float* expand(float* d_trees, int num_trees, int tree_arr_length, int new_tree_arr_length){
@@ -145,7 +151,6 @@ __global__ void get_max_tree_length(int* d_tree_lengths, int num_trees, int* d_m
 		tree_length_buffer[threadIdx.x] = d_tree_lengths[threadIdx.x];
 	}else{
 		tree_length_buffer[threadIdx.x] = -1;
-		return;
 	}
 	
 	for(int stride=blockDim.x/2; stride > 0; stride >>=1){
@@ -315,6 +320,37 @@ void collect_min_max(float* d_x, int* d_batch_pos, int desired_pos, int num_tree
 		d_x, d_batch_pos, desired_pos, num_trees, x_length, d_min_max_buffer
 	);	
 }
+__global__ void kernel_collect_num_valid_feat(int* d_num_valid_feat, float* d_min_max_buffer, int num_trees){
+	extern __shared__ int shared_num_valid_feat_buffer[];
+	// blockIdx.x = tree_id
+	int sub_num_valid_feat, feat_i;
+	sub_num_valid_feat = 0;
+	for(feat_i=threadIdx.x; feat_i<FEATURE; feat_i+=blockDim.x){
+		if(d_min_max_buffer[ixt(feat_i, 0, blockIdx.x, 2, num_trees)] != 
+			d_min_max_buffer[ixt(feat_i, 1, blockIdx.x, 2, num_trees)]
+			){
+			sub_num_valid_feat++;
+		}
+	}
+	shared_num_valid_feat_buffer[threadIdx.x] = sub_num_valid_feat;
+	
+	for(int stride=blockDim.x/2; stride > 0; stride >>=1){
+		__syncthreads();
+		if(threadIdx.x < stride){
+			shared_num_valid_feat_buffer[threadIdx.x] += shared_num_valid_feat_buffer[threadIdx.x + stride];
+		}
+	}
+	if(threadIdx.x == 0){
+	   d_num_valid_feat[blockIdx.x] = shared_num_valid_feat_buffer[0];
+	}
+}
+void collect_num_valid_feat(int* d_num_valid_feat, float* d_min_max_buffer, int num_trees, cudaDeviceProp dev_prop){
+	// Ripe for optimization
+	int block_size = MIN(dev_prop.maxThreadsPerBlock, next_pow_2(FEATURE)); // Copy this to other places too
+	kernel_collect_num_valid_feat<<<num_trees, block_size, block_size>>>(
+		d_num_valid_feat, d_min_max_buffer, num_trees
+	);
+}
 
 int main(int argc,char *argv[])
 {
@@ -335,6 +371,7 @@ int main(int argc,char *argv[])
 	int *tree_lengths, *d_tree_lengths;
 	int *max_tree_length, *d_max_tree_length;
 	int feat_per_node;
+	int *num_valid_feat, *d_num_valid_feat;
 	int tree_pos;
 	int *batch_pos, *d_batch_pos; // NUM_TRESS * TRAIN_NUM
 	float *min_max_buffer, *d_min_max_buffer;
@@ -362,6 +399,7 @@ int main(int argc,char *argv[])
 	batch_pos = (int *)malloc(num_trees * TRAIN_NUM *sizeof(float));
 	min_max_buffer = (float *)malloc(num_trees * FEATURE * 2 *sizeof(float));
 	
+	num_valid_feat = (int *)malloc(num_trees * sizeof(int));
 	random_feats = (int *)malloc(num_trees * feat_per_node * sizeof(int));
 	random_cuts = (float *)malloc(num_trees * feat_per_node * sizeof(float));
 
@@ -374,6 +412,7 @@ int main(int argc,char *argv[])
 	cudaMalloc((void **) &d_max_tree_length, sizeof(int));
 	cudaMalloc((void **) &d_batch_pos, num_trees * TRAIN_NUM *sizeof(float));
 	cudaMalloc((void **) &d_min_max_buffer, num_trees * FEATURE * 2 *sizeof(float));
+	cudaMalloc((void **) &d_num_valid_feat, num_trees *sizeof(int));
 	cudaMalloc((void **) &d_random_feats, num_trees * feat_per_node * sizeof(int));
 	cudaMalloc((void **) &d_random_cuts, num_trees * feat_per_node * sizeof(float));
 	cudaMalloc((void **) &d_class_counts_a, num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int));
@@ -393,12 +432,21 @@ int main(int argc,char *argv[])
 
 	collect_min_max(d_x, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
 					d_min_max_buffer, dev_prop);
+	collect_num_valid_feat(
+		d_num_valid_feat, d_min_max_buffer, num_trees, dev_prop
+	);
 
 	cudaMemcpy(min_max_buffer, d_min_max_buffer, num_trees * FEATURE * 2 *sizeof(float), cudaMemcpyDeviceToHost);
 	for(int i=0; i<FEATURE; i++){
 		printf("%f %f\n", min_max_buffer[ixt(i, 0, 0, 2, num_trees)], 
 			              min_max_buffer[ixt(i, 1, 0, 2, num_trees)]);
 	}
+	cudaMemcpy(num_valid_feat, d_num_valid_feat, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
+	for(int i=0; i<num_trees; i++){
+		printf("%d ", num_valid_feat[i]);
+	}
+	printf("\n");
+
 	debug(0);
 
 	/*
