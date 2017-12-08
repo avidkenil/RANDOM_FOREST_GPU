@@ -4,6 +4,7 @@
 #include <math.h>
 #include <assert.h>
 #include <float.h>
+#include <curand.h>
 #include <curand_kernel.h>
 
 #define TRAIN_NUM 120
@@ -130,9 +131,32 @@ void debug(int i){
 		printf("%d Cuda failure %s:%d: '%s'\n", i, __FILE__,__LINE__,cudaGetErrorString(e));    
 	}
 }
-__global__ void init_random_generator(curandState *state){
-	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	curand_init(1337, idx, 0, &state[idx]);
+void copy_transpose(float* to, float* from, int h, int w){
+	for(int i=0; i<h; i++){
+		for(int j=0; j<w; j++){
+			to[index(j, i, h)] = from[index(i, j, w)];
+		}
+	}
+}
+
+/* === Random Init === */
+__global__ void init_random(unsigned int seed, curandState_t* states) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	curand_init(seed, tid, 0, &states[tid]);
+}
+__global__ void kernel_init_binomial_table(int* d_binomial_table) {
+	int n = blockIdx.x * blockDim.x + threadIdx.x;
+	int curr = 1;
+	d_binomial_table[index(n, 0, FEATURE+1)] = curr;
+	for(int k=1; k<FEATURE+1; k++){
+		curr *= (n+1 - k);
+		curr /= k;
+		d_binomial_table[index(n, k, FEATURE+1)] = curr;
+		printf("[%d, %d] = %d\n", n, k, curr);
+	}
+}
+void init_binomial_table(int* d_binomial_table, int feat_per_node){
+	kernel_init_binomial_table<<<1, feat_per_node+1>>>(d_binomial_table);
 }
 
 /* === Expanding tree memory === */
@@ -271,7 +295,7 @@ void batch_advance_trees(float *d_tree, float *d_x, int x_length, int tree_arr_l
 }
 
 /* === Valid features === */
-__global__ void kernel_collect_min_max(float* d_x, int* d_batch_pos, int desired_pos, int num_trees, 
+__global__ void kernel_collect_min_max(float* d_x_T, int* d_batch_pos, int desired_pos, int num_trees, 
 									   int x_length, float* d_min_max_buffer){
 	extern __shared__ float shared_min_max[]; // threadIdx.x * 2
 	// Ripe for optimization.
@@ -283,7 +307,7 @@ __global__ void kernel_collect_min_max(float* d_x, int* d_batch_pos, int desired
 	maximum = -FLT_MAX;
 	for(x_i=threadIdx.x; x_i < x_length; x_i+=blockDim.x){
 		if(d_batch_pos[index(blockIdx.x, x_i, x_length)] == desired_pos){
-			val = d_x[index(x_i, blockIdx.y, FEATURE)];
+			val = d_x_T[index(blockIdx.y, x_i, TRAIN_NUM)];
 			if(val < minimum){
 				minimum = val;
 			}
@@ -312,12 +336,12 @@ __global__ void kernel_collect_min_max(float* d_x, int* d_batch_pos, int desired
 		
 	}
 }
-void collect_min_max(float* d_x, int* d_batch_pos, int desired_pos, int num_trees, int x_length,
+void collect_min_max(float* d_x_T, int* d_batch_pos, int desired_pos, int num_trees, int x_length,
 					 float* d_min_max_buffer, cudaDeviceProp dev_prop){
 	// Ripe for optimization.
 	dim3 grid(num_trees, FEATURE);
-	kernel_collect_min_max<<<grid, dev_prop.maxThreadsPerBlock, dev_prop.maxThreadsPerBlock * sizeof(int) * 2>>>(
-		d_x, d_batch_pos, desired_pos, num_trees, x_length, d_min_max_buffer
+	kernel_collect_min_max<<<grid, 64, 64 * sizeof(int) * 2>>>(
+		d_x_T, d_batch_pos, desired_pos, num_trees, x_length, d_min_max_buffer
 	);	
 }
 __global__ void kernel_collect_num_valid_feat(int* d_num_valid_feat, float* d_min_max_buffer, int num_trees){
@@ -364,6 +388,10 @@ int main(int argc,char *argv[])
 	read_csv_iris(dataset_train,labels_train,TRAIN_NUM,file_train_set);
 	read_csv_iris(dataset_test,labels_test,TEST_NUM,file_test_set);
 	
+	float *dataset_train_T;
+	dataset_train_T = (float *)malloc(TRAIN_NUM * FEATURE * sizeof(float));
+	copy_transpose(dataset_train_T, dataset_train, TRAIN_NUM, FEATURE);
+
 	float *trees, *d_trees;
 	int *tree_arr_length;
 	int *tree_lengths, *d_tree_lengths;
@@ -371,7 +399,7 @@ int main(int argc,char *argv[])
 	int feat_per_node;
 	int *num_valid_feat, *d_num_valid_feat;
 	int tree_pos;
-	int *batch_pos, *d_batch_pos; // NUM_TRESS * TRAIN_NUM
+	int *batch_pos, *d_batch_pos; // NUM_TREES * TRAIN_NUM
 	float *min_max_buffer, *d_min_max_buffer;
 	int *random_feats, *d_random_feats;
 	float *random_cuts, *d_random_cuts;
@@ -379,11 +407,13 @@ int main(int argc,char *argv[])
 	int *d_class_counts_a, *d_class_counts_b;
 	int prev_depth, max_depth;
 	float *d_x, *d_y;
+	float *d_x_T;
+	curandState_t* curand_states;
+	int *d_binomial_table;
 
 	int num_trees;
-	num_trees = 5;
+	num_trees = 200;
 	// Assumption: num_trees < maxNumBlocks, maxThreadsPerBlock
-	printf("num_trees %d\n", num_trees);
 	srand(2);
 
 	tree_arr_length = (int *)malloc(sizeof(int));
@@ -417,8 +447,17 @@ int main(int argc,char *argv[])
 	cudaMalloc((void **) &d_class_counts_b, num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int));
 	cudaMalloc((void **) &d_x, TRAIN_NUM * FEATURE *sizeof(float));
 	cudaMalloc((void **) &d_y, TRAIN_NUM *sizeof(float));
+	cudaMalloc((void **) &d_x_T, TRAIN_NUM * FEATURE *sizeof(float));
+	cudaMalloc((void **) &d_binomial_table, (feat_per_node+1) * (FEATURE+1) *sizeof(int));
 	cudaMemcpy(d_x, dataset_train, TRAIN_NUM * FEATURE *sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(d_y, labels_train, TRAIN_NUM *sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_x_T, dataset_train_T, TRAIN_NUM * FEATURE *sizeof(float), cudaMemcpyHostToDevice);
+
+
+	cudaMalloc((void**) &curand_states, num_trees * sizeof(curandState));
+	init_random<<<1, num_trees>>>(1337, curand_states);
+	init_binomial_table(d_binomial_table, feat_per_node);
+
 
 	tree_pos = 0;
 	initialize_trees(d_trees, num_trees, *tree_arr_length, d_tree_lengths);
@@ -427,16 +466,19 @@ int main(int argc,char *argv[])
 	//batch_traverse_trees(d_trees, d_x, TRAIN_NUM, num_trees, d_batch_pos, dev_prop);
 	initialize_batch_pos(d_batch_pos, TRAIN_NUM, num_trees, dev_prop);
 	batch_advance_trees(d_trees, d_x, TRAIN_NUM, *tree_arr_length, num_trees, d_batch_pos, dev_prop);
-	collect_min_max(d_x, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
+	collect_min_max(d_x_T, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
 					d_min_max_buffer, dev_prop);
 	collect_num_valid_feat(
 		d_num_valid_feat, d_min_max_buffer, num_trees, dev_prop
 	);
 	cudaMemcpy(num_valid_feat, d_num_valid_feat, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
-	printf("\n");
 	for(int i=0; i<num_trees; i++){
 		printf("%d ", num_valid_feat[i]);
 	}
+	printf("\n");
+
+	printf("%d\n", feat_per_node);
+
 	printf("\n");
 	debug(0);
 }
