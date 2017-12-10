@@ -177,8 +177,6 @@ void expand(float** d_trees_ptr, int num_trees, int tree_arr_length, int new_tre
 	assert(new_tree_arr_length >= tree_arr_length);
 
 	cudaMalloc((void **) &new_d_trees, num_trees * NUM_FIELDS * new_tree_arr_length * sizeof(float));
-	printf("Malloced: %d\n", num_trees * NUM_FIELDS * new_tree_arr_length);
-	//cudaMemcpy(new_d_trees, d_trees, num_trees * NUM_FIELDS * tree_arr_length *sizeof(float), cudaMemcpyDeviceToDevice);
 	for(int i=0; i<num_trees; i++){
 		cudaMemcpy(
 			new_d_trees + i * (NUM_FIELDS * new_tree_arr_length), 
@@ -216,7 +214,6 @@ void maybe_expand(float** d_trees_ptr, int num_trees, int* tree_arr_length, int*
 	get_max_tree_length<<<1, num_trees, next_pow_2(num_trees) * sizeof(int)>>>(
 		d_tree_lengths, num_trees, d_max_tree_length
 	);
-	printf("get_max_tree_length(%d, %d, %d)\n", 1, num_trees, next_pow_2(num_trees));
 	cudaMemcpy(max_tree_length, d_max_tree_length, sizeof(int), cudaMemcpyDeviceToHost);
 
 	// Buffer of 2 => up to 2 additions at a time
@@ -291,40 +288,48 @@ int check_forest_done(int* d_tree_is_done, int *tree_is_done, int num_trees){
 }
 
 /* === Tree Traversal === */
-__global__ void kernel_traverse_trees(float *d_trees, float* d_x, int x_length, int num_trees, int* d_batch_pos){
+__global__ void kernel_traverse_trees(
+			float *d_trees, float* d_x, 
+			int x_length, int num_trees, int tree_arr_length, 
+			int* d_batch_pos
+		){
 	// Should optimize this. It's just a bunch of global reads.
 	// Also possibly to rewrite this and batch_traverse to support a "next-step" method instead of a full 
 	//   traversal while growing
-	int pos, new_pos, left_right_key, x_i, tree_id;
-	//Overloading x_i as tx
-	x_i = threadIdx.x + blockIdx.x * blockDim.x;
-	if(x_i >= x_length * num_trees) return;
+	int pos, new_pos, left_right_key, x_i, tree_id, tx;
+	tx = threadIdx.x + blockIdx.x * blockDim.x;
+	if(tx >= x_length * num_trees) return;
 
 	// Actually get x_i, tree_id
-	tree_id = x_i % num_trees;
-	x_i = x_i / num_trees;
+	tree_id = tx % num_trees;
+	x_i = tx / num_trees;
 	pos = 0;
     while(1){
-        if(d_x[index(x_i, (int) d_trees[ixt(pos, FEAT_KEY, tree_id, NUM_FIELDS, TRAIN_NUM)], FEATURE)] < 
-        		d_trees[ixt(pos, CUT_KEY, tree_id, NUM_FIELDS, TRAIN_NUM)]){
+        if(d_x[index(x_i, (int) d_trees[ixt(pos, FEAT_KEY, tree_id, NUM_FIELDS, tree_arr_length)], FEATURE)] < 
+        		d_trees[ixt(pos, CUT_KEY, tree_id, NUM_FIELDS, tree_arr_length)]){
             left_right_key = LEFT_KEY;
         }else{
             left_right_key = RIGHT_KEY;
         }
-        new_pos = (int) d_trees[ixt(pos, left_right_key, tree_id, NUM_FIELDS, TRAIN_NUM)];
+        new_pos = (int) d_trees[ixt(pos, left_right_key, tree_id, NUM_FIELDS, tree_arr_length)];
         if(new_pos == pos){
             // Leaf nodes are set up to be idempotent
             break;
         }
         pos = new_pos;
     }
-    d_batch_pos[index(tree_id, x_i, TRAIN_NUM)] = pos;
+    d_batch_pos[index(tree_id, x_i, x_length)] = pos;
 }
-void batch_traverse_trees(float *d_tree, float *d_x, int x_length, int num_trees, int *d_batch_pos, cudaDeviceProp dev_prop){
+void batch_traverse_trees(
+			float *d_trees, float *d_x, 
+			int x_length, int num_trees, int tree_arr_length, 
+			int *d_batch_pos, cudaDeviceProp dev_prop){
 	int block_size, num_blocks;
  	block_size = dev_prop.maxThreadsPerBlock;
  	num_blocks = ceil(num_trees * x_length/((float) block_size));
-	kernel_traverse_trees<<<num_blocks, block_size>>>(d_tree, d_x, x_length, num_trees, d_batch_pos);
+	kernel_traverse_trees<<<num_blocks, block_size>>>(
+		d_trees, d_x, x_length, num_trees, tree_arr_length, d_batch_pos
+	);
 }
 __global__ void kernel_advance_trees(float *d_trees, float* d_x, int x_length, int tree_arr_length, int num_trees, int* d_batch_pos){
 	int pos, left_right_key, x_i;
@@ -380,8 +385,7 @@ __global__ void kernel_check_node_termination(
 
 	if(base_y==-1){
 		printf("ERROR ERROR ERROR EMPTY 1TREE %d\n", threadIdx.x);
-		printf("ERROR ERROR ERROR EMPTY 2TREE %d\n", threadIdx.x);
-		printf("ERROR ERROR ERROR EMPTY 2TREE %d\n", threadIdx.x);
+		assert(false);
 	}
 
 	if(!is_branch_node){
@@ -399,6 +403,7 @@ void check_node_termination(
 		d_y, d_batch_pos, tree_pos,
 		d_is_branch_node, d_tree_is_done
 	);
+	debug();
 }
 
 /* === Valid features === */
@@ -749,6 +754,59 @@ void update_trees(
 	);
 }
 
+/* === Evaluate === */
+__global__ void kernel_raw_predict(
+			float *d_raw_pred_y, float* d_trees, int* d_batch_pos, int tree_arr_length, int x_length
+		){
+	// threadIdx.x = tree_id, blockIdx.x = x_i
+	int pos;
+	pos = d_batch_pos[index(threadIdx.x, blockIdx.x, x_length)];
+	d_raw_pred_y[index(threadIdx.x, blockIdx.x, x_length)] = d_trees[
+		ixt(pos, PRED_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)];
+}
+void raw_predict(
+			float *d_raw_pred_y, float* d_trees, int* d_batch_pos, int tree_arr_length, int x_length,
+			int num_trees
+		){
+	kernel_raw_predict<<<x_length, num_trees>>>(
+		d_raw_pred_y, d_trees, d_batch_pos, tree_arr_length, x_length
+	);
+}
+void predict(float* pred_y, float* raw_pred_y, int x_length, int num_trees){
+	int *class_count_buffer;
+	int i, j, k, pred, maximum, maximum_class;
+	class_count_buffer = (int *)malloc(NUMBER_OF_CLASSES * sizeof(int));
+	for(k=0; k<NUMBER_OF_CLASSES; k++){
+		class_count_buffer[k] = 0;
+	}
+	for(i=0; i<x_length; i++){
+		for(j=0; j<num_trees; j++){
+			pred = (int) raw_pred_y[index(j, i, x_length)];
+			class_count_buffer[pred]++;
+		}
+		maximum = -1;
+		for(k=0; k<NUMBER_OF_CLASSES; k++){
+			if(class_count_buffer[k] > maximum){
+				maximum = class_count_buffer[k];
+				maximum_class = k;
+			}
+			class_count_buffer[k] = 0;
+		}
+		pred_y[i] = (float) maximum_class;
+	}
+}
+float evaluate(float* pred_y, float* true_y, int y_length){
+	int i;
+	float score;
+	score = 0;
+	for(i=0; i<y_length; i++){
+		if((int) pred_y[i] == (int) true_y[i]){
+			score += 1;
+		}
+	}
+	score /= y_length;
+	return score;
+}
 
 int main(int argc,char *argv[])
 {
@@ -787,10 +845,11 @@ int main(int argc,char *argv[])
 	int prev_depth, max_depth;
 	float *d_x, *d_y;
 	float *d_x_T;
+	float *pred_y, *raw_pred_y, *d_raw_pred_y;
 	curandState_t* curand_states;
 
 	int num_trees;
-	num_trees = 1;
+	num_trees = 200;
 	// Assumption: num_trees < maxNumBlocks, maxThreadsPerBlock
 	srand(2);
 
@@ -846,24 +905,25 @@ int main(int argc,char *argv[])
 	initialize_trees(d_trees, num_trees, *tree_arr_length, d_tree_lengths);
 	initialize_batch_pos(d_batch_pos, TRAIN_NUM, num_trees, dev_prop);
 
-	for(tree_pos=0; tree_pos<200; tree_pos++){
+	for(tree_pos=0; tree_pos<5000; tree_pos++){
 		printf("* ================== TREE POS -[ %d ]- ================== *\n", tree_pos);
 
 		trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
 		cudaMemcpy(trees, d_trees, num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float), cudaMemcpyDeviceToHost);
 		printf("%d\n", num_trees * NUM_FIELDS * (*tree_arr_length));
-		for(int i=0; i<num_trees; i++){
+		for(int i=3; i<4; i++){
 			printf("T=%d    ", i);
-			for(int j=0; j<=10; j++){
+			for(int j=0; j<=40; j++){
 				printf("%d ", (int) trees[ixt(j, LEFT_KEY, i, NUM_FIELDS, *tree_arr_length)]);
 			}
 			printf("\n       ");
-			for(int j=0; j<=10; j++){
+			for(int j=0; j<=40; j++){
 				printf("%d ", (int) trees[ixt(j, RIGHT_KEY, i, NUM_FIELDS, *tree_arr_length)]);
 			}
 			printf("\n");
 		}
 		free(trees);
+
 		refresh_tree_is_done(d_tree_lengths, d_tree_is_done, tree_pos, num_trees);
 		if(check_forest_done(d_tree_is_done, tree_is_done, num_trees)){
 			printf("DONE\n");
@@ -873,30 +933,12 @@ int main(int argc,char *argv[])
 		maybe_expand(&d_trees, num_trees, tree_arr_length, d_tree_lengths, max_tree_length, d_max_tree_length);
 		batch_advance_trees(d_trees, d_x, TRAIN_NUM, *tree_arr_length, num_trees, d_batch_pos, dev_prop);
 
-		cudaMemcpy(batch_pos, d_batch_pos, num_trees * TRAIN_NUM * sizeof(float), cudaMemcpyDeviceToHost);
-		for(int i=0; i<num_trees; i++){
-			//printf("T=%d traverse\n", i);
-			for(int j=0; j<TRAIN_NUM; j++){
-				//printf("%d ", batch_pos[index(i, j, TRAIN_NUM)]);
-			}
-			//printf("\n");
-		}
-
 		check_node_termination(
 			d_trees, *tree_arr_length, 
 			d_y, d_batch_pos, tree_pos,
 			d_is_branch_node, d_tree_is_done,
 			num_trees
 		);
-
-		// ^^
-		cudaMemcpy(is_branch_node, d_is_branch_node, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
-		cudaMemcpy(tree_is_done, d_tree_is_done, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
-		printf("TREE IS DONE  : ");
-		for(int i=0; i<num_trees; i++){printf("%d ", tree_is_done[i]);};printf("\n");
-		printf("IS BRANCH NODE: ");
-		for(int i=0; i<num_trees; i++){printf("%d ", is_branch_node[i]);};printf("\n");
-		// VV
 
 		collect_min_max(
 			d_x_T, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
@@ -908,18 +950,6 @@ int main(int argc,char *argv[])
 		populate_valid_feat_idx(
 			d_random_feats, d_num_valid_feat, feat_per_node, num_trees, d_is_branch_node, curand_states
 		);
-
-		// AAAA
-		/*
-		cudaMemcpy(random_feats, d_random_feats, num_trees * feat_per_node * sizeof(int), cudaMemcpyDeviceToHost);
-		for(int i=0; i<num_trees; i++){
-			printf("T=%d:  ", i);
-			for(int j=0; j<feat_per_node; j++){
-				printf("%d(%d)  ", random_feats[index(i, j, feat_per_node)], index(i, j, feat_per_node));
-			}
-			printf("\n");
-		}*/
-		// ZZZZ
 
 		populate_feat_cut(
 			d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, 
@@ -953,7 +983,8 @@ int main(int argc,char *argv[])
 		cudaMemcpy(best_cuts, d_best_cuts, num_trees *  sizeof(float), cudaMemcpyDeviceToHost);
 
 		int x1;
-		for(int i=0; i<num_trees; i++){
+		
+		for(int i=3; i<4; i++){
 			printf("T=%d\n", i);
 			x1 = 0;
 			for(int j=0; j<feat_per_node; j++){
@@ -972,34 +1003,34 @@ int main(int argc,char *argv[])
 				printf("   ===>   %d", x1);
 				printf("\n");
 			}
-			printf("\n");
-		}
-		for(int i=0; i<num_trees; i++){
 			printf("T=%d ==> %d/%f\n", i, best_feats[i], best_cuts[i]);
 		}
 
 	}
+	printf("================= DONE TRAINING =================\n");
+	/* === TEST === */
+	cudaFree(d_batch_pos);
+	free(batch_pos);
+	cudaMalloc((void **) &d_batch_pos, num_trees * TEST_NUM * sizeof(float));
+	pred_y = (float *)malloc(TEST_NUM * sizeof(float));
+	raw_pred_y = (float *)malloc(num_trees * TEST_NUM * sizeof(float));
 
-	/*
-	for(int i=0; i<num_trees; i++){
-		for(int j=0; j<feat_per_node; j++){
-			printf("  %d %d %f \n", j, random_feats[index(i, j, feat_per_node)],
-				                       random_cuts[index(i, j, feat_per_node)]);
-		}
-		printf("\n");
-	}
-	printf("%d\n", feat_per_node);
-	*/
+	cudaFree(d_x);
+	cudaMalloc((void **) &d_x, TEST_NUM * FEATURE * sizeof(float));
+	cudaMalloc((void **) &d_raw_pred_y, num_trees * TEST_NUM * sizeof(float));
+	cudaMemcpy(d_x, dataset_test, TEST_NUM * FEATURE * sizeof(float), cudaMemcpyHostToDevice);
 
+	initialize_batch_pos(
+		d_batch_pos, TEST_NUM, num_trees, dev_prop
+	);
+	batch_traverse_trees(
+		d_trees, d_x, TEST_NUM, num_trees, *tree_arr_length, d_batch_pos, dev_prop
+	);
+	cudaMemcpy(d_x, dataset_test, TEST_NUM * FEATURE * sizeof(float), cudaMemcpyHostToDevice);
+	raw_predict(d_raw_pred_y, d_trees, d_batch_pos, *tree_arr_length, TEST_NUM, num_trees);
+	cudaMemcpy(raw_pred_y, d_raw_pred_y, num_trees * TEST_NUM * sizeof(float), cudaMemcpyDeviceToHost);
+	predict(pred_y, raw_pred_y, TEST_NUM, num_trees);
 
-		/*
-			TO DO:
-				- Expanding is broken
-				- Check 2nd level filter
-				- Implement terminal nodes
-				- Randomness might be broken
-		*/
-
-	printf("\n");
+	printf("Test Accuracy: %f\n", evaluate(pred_y, labels_test, TEST_NUM));
 	debug();
 }

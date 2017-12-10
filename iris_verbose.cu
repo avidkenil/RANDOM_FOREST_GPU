@@ -1,16 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include <assert.h>
 #include <float.h>
-#include "MnistPreProcess.h"
 #include <curand.h>
 #include <curand_kernel.h>
 
-#define TRAIN_NUM 60000
-#define TEST_NUM 10000
-#define FEATURE 784
-#define NUMBER_OF_CLASSES 10
+#define TRAIN_NUM 100
+#define TEST_NUM 50
+#define FEATURE 4
+#define NUMBER_OF_CLASSES 3
+
 
 #define FEAT_KEY 0
 #define CUT_KEY 1
@@ -22,47 +23,101 @@
 #define NUM_FIELDS 6
 
 #define index(i, j, N)  ((i)*(N)) + (j)
-#define index(i, j, N)  ((i)*(N)) + (j)
 #define ixt(i, j, t, N, T) ((t)*(N)*(T)) + ((i)*(N)) + (j)
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
  
-
-
-void readData(float* dataset,float*labels,const char* dataPath,const char*labelPath)
+int countNumRows(char *filename)
 {
-	FILE* dataFile=fopen(dataPath,"rb");
-	FILE* labelFile=fopen(labelPath,"rb");
-	int mbs=0,number=0,col=0,row=0;
-	fread(&mbs,4,1,dataFile);
-	fread(&number,4,1,dataFile);
-	fread(&row,4,1,dataFile);
-	fread(&col,4,1,dataFile);
-	revertInt(&mbs);
-	revertInt(&number);
-	revertInt(&row);
-	revertInt(&col);
-	fread(&mbs,4,1,labelFile);
-	fread(&number,4,1,labelFile);
-	revertInt(&mbs);
-	revertInt(&number);
-	unsigned char temp;
-	for(int i=0;i<number;++i)
+	FILE *fp;
+	int count = 0;  // Line counter (result)
+	//char filename[MAX_FILE_NAME];
+	char c;  // To store a character read from file
+ 
+	// Get file name from user. The file should be
+	// either in current folder or complete path should be provided
+	//printf("Enter file name: ");
+	//scanf("%s", filename);
+ 
+	// Open the file
+	fp = fopen(filename, "r");
+ 
+	// Check if file exists
+	if (fp == NULL)
 	{
-		for(int j=0;j<row*col;++j)
-		{
-			fread(&temp,1,1,dataFile);
-			//dataset[i][j]=static_cast<float>(temp);
-			dataset[(i*row*col) + j] = (float)temp;
-		}
-		fread(&temp,1,1,labelFile);
-		//printf("%s\n",*temp );
-		//labels[i]=static_cast<float>(temp);
-		labels[i] = (float)temp;
-		//printf("%f\n", labels[i]);
+		printf("Could not open file %s", filename);
+		return -1;
 	}
-	fclose(dataFile);
-	fclose(labelFile);
+ 
+	// Extract characters from file and store in character c
+	for (c = getc(fp); c != EOF; c = getc(fp))
+		if (c == '\n') // Increment count if this character is newline
+			count = count + 1;
+ 
+	// Close the file
+	fclose(fp);
+	//printf("The file %s has %d lines\n ", filename, count);
+ 
+	return count;
+}
+
+const char* getfield(char* line, int num){
+	const char* tok;
+	for (tok = strtok(line, ",");
+			tok && *tok;
+			tok = strtok(NULL, ",\n"))
+	{
+		if (!--num)
+			return tok;
+	}
+	return NULL;
+}
+/*
+Labels for IRIS:
+Iris-setosa - 0
+Iris-versicolor - 1
+Iris-virginica - 2
+*/
+void read_csv_iris(float *data, float *label, int row_count, char *filename){
+	//data = (float *)malloc(row_count*4*sizeof(float));
+	//label = (int *)malloc(row_count*sizeof(int));
+	FILE *fp = fopen(filename,"r");
+	char line[1024];
+	int idx = 0;
+	for(int iter = 0;iter<row_count;iter++)
+	{
+		fgets(line,1024,fp);
+		const char *temp_field;
+		for(int i=0;i<5;i++)
+		{
+			float temp_num;
+			char *tmp = strdup(line);
+			temp_field = getfield(tmp,i+1);
+			if(i==4)
+			{
+				if(strcmp(temp_field,"Iris-setosa")==0)
+				{
+					label[idx] = 0;
+					continue;
+				}
+				if(strcmp(temp_field,"Iris-versicolor")==0)
+				{
+					label[idx] = 1;
+					continue;
+				}
+				if(strcmp(temp_field,"Iris-virginica")==0)
+				{
+					label[idx] = 2;
+					continue;
+				}
+			}
+			temp_num = atof(temp_field);
+			data[idx*4 + i] = temp_num;
+		}
+		idx++;
+		
+	}
 }
 
 
@@ -740,6 +795,7 @@ void predict(float* pred_y, float* raw_pred_y, int x_length, int num_trees){
 			}
 			class_count_buffer[k] = 0;
 		}
+		printf("Setting %d to %d with counts %d\n", i, maximum_class, maximum);
 		pred_y[i] = (float) maximum_class;
 	}
 }
@@ -756,8 +812,7 @@ float evaluate(float* pred_y, float* true_y, int y_length){
 	return score;
 }
 
-
-int main(int argc, char * argv[])
+int main(int argc,char *argv[])
 {
 	float *dataset_train,*dataset_test;
 	float *labels_train,*labels_test;
@@ -765,14 +820,11 @@ int main(int argc, char * argv[])
 	labels_train = (float *)malloc(TRAIN_NUM*sizeof(float));
 	dataset_test = (float *)malloc(FEATURE * TEST_NUM*sizeof(float));
 	labels_test = (float *)malloc(TEST_NUM*sizeof(float));
-
-	char file_train_set[] = "data/train-images-idx3-ubyte";
-	char file_train_label[] = "data/train-labels-idx1-ubyte";
-	char file_test_set[] = "data/t10k-images-idx3-ubyte";
-	char file_test_label[] = "data/t10k-labels-idx1-ubyte";
-	readData(dataset_train,labels_train,file_train_set,file_train_label);
-	readData(dataset_test,labels_test,file_test_set,file_test_label);
-
+	char file_train_set[] = "data/iris_train.data";
+	char file_test_set[] = "data/iris_test.data";
+	read_csv_iris(dataset_train,labels_train,TRAIN_NUM,file_train_set);
+	read_csv_iris(dataset_test,labels_test,TEST_NUM,file_test_set);
+	
 	float *dataset_train_T;
 	dataset_train_T = (float *)malloc(TRAIN_NUM * FEATURE * sizeof(float));
 	copy_transpose(dataset_train_T, dataset_train, TRAIN_NUM, FEATURE);
@@ -801,7 +853,7 @@ int main(int argc, char * argv[])
 	curandState_t* curand_states;
 
 	int num_trees;
-	num_trees = 1;
+	num_trees = 200;
 	// Assumption: num_trees < maxNumBlocks, maxThreadsPerBlock
 	srand(2);
 
@@ -857,8 +909,24 @@ int main(int argc, char * argv[])
 	initialize_trees(d_trees, num_trees, *tree_arr_length, d_tree_lengths);
 	initialize_batch_pos(d_batch_pos, TRAIN_NUM, num_trees, dev_prop);
 
-	for(tree_pos=0; tree_pos<5000; tree_pos++){
+	for(tree_pos=0; tree_pos<200; tree_pos++){
 		printf("* ================== TREE POS -[ %d ]- ================== *\n", tree_pos);
+
+		trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
+		cudaMemcpy(trees, d_trees, num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float), cudaMemcpyDeviceToHost);
+		printf("%d\n", num_trees * NUM_FIELDS * (*tree_arr_length));
+		for(int i=0; i<num_trees; i++){
+			printf("T=%d    ", i);
+			for(int j=0; j<=10; j++){
+				printf("%d ", (int) trees[ixt(j, LEFT_KEY, i, NUM_FIELDS, *tree_arr_length)]);
+			}
+			printf("\n       ");
+			for(int j=0; j<=10; j++){
+				printf("%d ", (int) trees[ixt(j, RIGHT_KEY, i, NUM_FIELDS, *tree_arr_length)]);
+			}
+			printf("\n");
+		}
+		free(trees);
 		refresh_tree_is_done(d_tree_lengths, d_tree_is_done, tree_pos, num_trees);
 		if(check_forest_done(d_tree_is_done, tree_is_done, num_trees)){
 			printf("DONE\n");
@@ -868,12 +936,30 @@ int main(int argc, char * argv[])
 		maybe_expand(&d_trees, num_trees, tree_arr_length, d_tree_lengths, max_tree_length, d_max_tree_length);
 		batch_advance_trees(d_trees, d_x, TRAIN_NUM, *tree_arr_length, num_trees, d_batch_pos, dev_prop);
 
+		cudaMemcpy(batch_pos, d_batch_pos, num_trees * TRAIN_NUM * sizeof(float), cudaMemcpyDeviceToHost);
+		for(int i=0; i<num_trees; i++){
+			//printf("T=%d traverse\n", i);
+			for(int j=0; j<TRAIN_NUM; j++){
+				//printf("%d ", batch_pos[index(i, j, TRAIN_NUM)]);
+			}
+			//printf("\n");
+		}
+
 		check_node_termination(
 			d_trees, *tree_arr_length, 
 			d_y, d_batch_pos, tree_pos,
 			d_is_branch_node, d_tree_is_done,
 			num_trees
 		);
+
+		// ^^
+		cudaMemcpy(is_branch_node, d_is_branch_node, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(tree_is_done, d_tree_is_done, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
+		printf("TREE IS DONE  : ");
+		for(int i=0; i<num_trees; i++){printf("%d ", tree_is_done[i]);};printf("\n");
+		printf("IS BRANCH NODE: ");
+		for(int i=0; i<num_trees; i++){printf("%d ", is_branch_node[i]);};printf("\n");
+		// VV
 
 		collect_min_max(
 			d_x_T, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
@@ -885,6 +971,18 @@ int main(int argc, char * argv[])
 		populate_valid_feat_idx(
 			d_random_feats, d_num_valid_feat, feat_per_node, num_trees, d_is_branch_node, curand_states
 		);
+
+		// AAAA
+		/*
+		cudaMemcpy(random_feats, d_random_feats, num_trees * feat_per_node * sizeof(int), cudaMemcpyDeviceToHost);
+		for(int i=0; i<num_trees; i++){
+			printf("T=%d:  ", i);
+			for(int j=0; j<feat_per_node; j++){
+				printf("%d(%d)  ", random_feats[index(i, j, feat_per_node)], index(i, j, feat_per_node));
+			}
+			printf("\n");
+		}*/
+		// ZZZZ
 
 		populate_feat_cut(
 			d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, 
@@ -910,7 +1008,61 @@ int main(int argc, char * argv[])
 			num_trees, 
 			d_is_branch_node
 		);
+		cudaMemcpy(random_feats, d_random_feats, num_trees * feat_per_node * sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(random_cuts, d_random_cuts, num_trees * feat_per_node * sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(class_counts_a, d_class_counts_a, num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(class_counts_b, d_class_counts_b, num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(best_feats, d_best_feats, num_trees *  sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(best_cuts, d_best_cuts, num_trees *  sizeof(float), cudaMemcpyDeviceToHost);
+
+		int x1;
+		for(int i=0; i<num_trees; i++){
+			printf("T=%d\n", i);
+			x1 = 0;
+			for(int j=0; j<feat_per_node; j++){
+				printf("  J=%d  @ %d---%f\n", j, random_feats[index(i, j, feat_per_node)], random_cuts[index(i, j, feat_per_node)]);
+				printf("    ");
+				for(int k=0; k<NUMBER_OF_CLASSES; k++){
+					x1 += class_counts_a[ixt(i, j, k, feat_per_node, num_trees)];
+					printf(" %d", class_counts_a[ixt(i, j, k, feat_per_node, num_trees)]);
+				}
+				printf("\n");
+				printf("    ");
+				for(int k=0; k<NUMBER_OF_CLASSES; k++){
+					x1 += class_counts_b[ixt(i, j, k, feat_per_node, num_trees)];
+					printf(" %d", class_counts_b[ixt(i, j, k, feat_per_node, num_trees)]);
+				}
+				printf("   ===>   %d", x1);
+				printf("\n");
+			}
+			printf("\n");
+		}
+		for(int i=0; i<num_trees; i++){
+			printf("T=%d ==> %d/%f\n", i, best_feats[i], best_cuts[i]);
+		}
+
 	}
+
+	/*
+	for(int i=0; i<num_trees; i++){
+		for(int j=0; j<feat_per_node; j++){
+			printf("  %d %d %f \n", j, random_feats[index(i, j, feat_per_node)],
+				                       random_cuts[index(i, j, feat_per_node)]);
+		}
+		printf("\n");
+	}
+	printf("%d\n", feat_per_node);
+	*/
+
+
+		/*
+			TO DO:
+				- Expanding is broken
+				- Check 2nd level filter
+				- Implement terminal nodes
+				- Randomness might be broken
+		*/
+
 	printf("================= DONE TRAINING =================\n");
 	/* === TEST === */
 	cudaFree(d_batch_pos);
@@ -935,6 +1087,34 @@ int main(int argc, char * argv[])
 	cudaMemcpy(raw_pred_y, d_raw_pred_y, num_trees * TEST_NUM * sizeof(float), cudaMemcpyDeviceToHost);
 	predict(pred_y, raw_pred_y, TEST_NUM, num_trees);
 
-	printf("Test Accuracy: %f\n", evaluate(pred_y, labels_test, TEST_NUM));
+	/*
+	trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
+	cudaMemcpy(trees, d_trees, num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float), cudaMemcpyDeviceToHost);
+	printf("%d\n", num_trees * NUM_FIELDS * (*tree_arr_length));
+	for(int i=0; i<num_trees; i++){
+		printf("T=%d    ", i);
+		for(int j=0; j<=10; j++){
+			printf("%d ", (int) trees[ixt(j, PRED_KEY, i, NUM_FIELDS, *tree_arr_length)]);
+		}
+		printf("\n");
+	}
+	cudaMemcpy(batch_pos, d_batch_pos, num_trees * TEST_NUM * sizeof(float), cudaMemcpyDeviceToHost);
+	for(int i=0; i<num_trees; i++){
+		printf("T=%d    ", i);
+		for(int j=0; j<=TEST_NUM; j++){
+			//printf("%d ", batch_pos[index(i, j, TEST_NUM)]);
+			printf("%d ", (int) trees[
+				ixt(batch_pos[index(i, j, TEST_NUM)], PRED_KEY, i, NUM_FIELDS, *tree_arr_length)
+			]);
+		}
+		printf("\n");
+	}
+
+	for(int i=0; i<TEST_NUM; i++){printf("%d ", (int) pred_y[i]);};printf("\n");
+	for(int i=0; i<TEST_NUM; i++){printf("%d ", (int) labels_test[i]);};printf("\n");
+	*/
+
+
+	printf("Accuracy: %f\n", evaluate(pred_y, labels_test, TEST_NUM));
 	debug();
 }
