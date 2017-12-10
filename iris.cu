@@ -26,6 +26,7 @@
 #define ixt(i, j, t, N, T) ((t)*(N)*(T)) + ((i)*(N)) + (j)
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
  
 int countNumRows(char *filename)
 {
@@ -127,17 +128,32 @@ int next_pow_2(int x){
 		y*=2;
 	return y;
 }
-void debug(int i){
-	cudaError_t e=cudaGetLastError();                                 \
-	if(e!=cudaSuccess) {                                              \
-		printf("%d Cuda failure %s:%d: '%s'\n", i, __FILE__,__LINE__,cudaGetErrorString(e));    
-	}
-}
 void copy_transpose(float* to, float* from, int h, int w){
 	for(int i=0; i<h; i++){
 		for(int j=0; j<w; j++){
 			to[index(j, i, h)] = from[index(i, j, w)];
 		}
+	}
+}
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true){
+	// From https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+void debug(){
+	cudaError_t code;
+	code = cudaPeekAtLastError();
+	if(code != cudaSuccess){
+		printf("GPUassert: Failed at Init: %s\n", cudaGetErrorString(code));
+		exit(code);
+	}
+	code = cudaDeviceSynchronize();
+	if(code != cudaSuccess){
+		printf("GPUassert: Failed at Execution: %s\n", cudaGetErrorString(code));
+		exit(code);
 	}
 }
 
@@ -155,14 +171,22 @@ __device__ float draw_uniform(float minimum, float maximum, curandState_t* state
 }
 
 /* === Expanding tree memory === */
-float* expand(float* d_trees, int num_trees, int tree_arr_length, int new_tree_arr_length){
-	float *new_d_trees;
+void expand(float** d_trees_ptr, int num_trees, int tree_arr_length, int new_tree_arr_length){
+	float *new_d_trees, *d_trees;
+	d_trees = *d_trees_ptr;
 	assert(new_tree_arr_length >= tree_arr_length);
 
-	cudaMalloc((void **) &new_d_trees, num_trees * NUM_FIELDS * new_tree_arr_length *sizeof(float));
-	cudaMemcpy(new_d_trees, d_trees, num_trees * NUM_FIELDS * tree_arr_length *sizeof(float), cudaMemcpyDeviceToDevice);
+	cudaMalloc((void **) &new_d_trees, num_trees * NUM_FIELDS * new_tree_arr_length * sizeof(float));
+	printf("Malloced: %d\n", num_trees * NUM_FIELDS * new_tree_arr_length);
+	//cudaMemcpy(new_d_trees, d_trees, num_trees * NUM_FIELDS * tree_arr_length *sizeof(float), cudaMemcpyDeviceToDevice);
+	for(int i=0; i<num_trees; i++){
+		cudaMemcpy(
+			new_d_trees + i * (NUM_FIELDS * new_tree_arr_length), 
+			d_trees + i * (NUM_FIELDS * tree_arr_length),  
+			(NUM_FIELDS * tree_arr_length) * sizeof(float), cudaMemcpyDeviceToDevice);
+	}
 	cudaFree(d_trees);
-	return new_d_trees;
+	*d_trees_ptr = new_d_trees;
 }
 __global__ void get_max_tree_length(int* d_tree_lengths, int num_trees, int* d_max_tree_length){
 	extern __shared__ int tree_length_buffer[];
@@ -184,19 +208,20 @@ __global__ void get_max_tree_length(int* d_tree_lengths, int num_trees, int* d_m
 	   d_max_tree_length[0] = tree_length_buffer[0];
 	}
 }
-float* maybe_expand(float* d_trees, int num_trees, int* tree_arr_length, int* d_tree_lengths,
+void maybe_expand(float** d_trees_ptr, int num_trees, int* tree_arr_length, int* d_tree_lengths,
 	                int* max_tree_length, int* d_max_tree_length){
 	// I wonder if it's faster just to compute max on CPU.
 	int new_tree_arr_length;
-	float *new_d_trees;
 
 	get_max_tree_length<<<1, num_trees, next_pow_2(num_trees) * sizeof(int)>>>(
 		d_tree_lengths, num_trees, d_max_tree_length
 	);
+	printf("get_max_tree_length(%d, %d, %d)\n", 1, num_trees, next_pow_2(num_trees));
 	cudaMemcpy(max_tree_length, d_max_tree_length, sizeof(int), cudaMemcpyDeviceToHost);
+
 	// Buffer of 2 => up to 2 additions at a time
 	if(*max_tree_length <= *tree_arr_length-3){
-		return d_trees;
+		return;
 	}else{
 		new_tree_arr_length = (*tree_arr_length) * 2;
         while(*max_tree_length > new_tree_arr_length-2){
@@ -204,9 +229,8 @@ float* maybe_expand(float* d_trees, int num_trees, int* tree_arr_length, int* d_
         }
 
         printf("Expanding to %d\n", new_tree_arr_length);
-        new_d_trees = expand(d_trees, num_trees, *tree_arr_length, new_tree_arr_length);
+        expand(d_trees_ptr, num_trees, *tree_arr_length, new_tree_arr_length);
         *tree_arr_length = new_tree_arr_length;
-        return new_d_trees;
 	}
 }
 
@@ -232,6 +256,8 @@ void initialize_batch_pos(int *d_batch_pos, int x_length, int num_trees, cudaDev
 		d_batch_pos, x_length, num_trees
 	);
 }
+
+/* === Tree Growth checks === */
 __global__ void kernel_refresh_tree_is_done(int* d_tree_lengths, int* d_tree_is_done, int tree_pos){
 	// threadIdx.x = tree_id
 	int is_done;
@@ -246,6 +272,22 @@ void refresh_tree_is_done(int* d_tree_lengths, int* d_tree_is_done, int tree_pos
 	kernel_refresh_tree_is_done<<<1, num_trees>>>(
 		d_tree_lengths, d_tree_is_done, tree_pos
 	);
+}
+int check_forest_done(int* d_tree_is_done, int *tree_is_done, int num_trees){
+	cudaMemcpy(tree_is_done, d_tree_is_done, num_trees * sizeof(int), cudaMemcpyDeviceToHost);
+	int trees_left;
+	trees_left = 0;
+	for(int i=0; i<num_trees; i++){
+		if(!tree_is_done[i]){
+			trees_left++;
+		}
+	}
+	printf("%d trees left to grow\n", trees_left);
+	if(trees_left == 0){
+		return 1;
+	}else{
+		return 0;
+	}
 }
 
 /* === Tree Traversal === */
@@ -361,12 +403,16 @@ void check_node_termination(
 
 /* === Valid features === */
 __global__ void kernel_collect_min_max(float* d_x_T, int* d_batch_pos, int desired_pos, int num_trees, 
-									   int x_length, float* d_min_max_buffer){
+									   int x_length, float* d_min_max_buffer, int* d_is_branch_node){
 	extern __shared__ float shared_min_max[]; // threadIdx.x * 2
 	// Ripe for optimization.
 	// threadIdx.x = x_i++, blockIdx.x = tree_id, feat = blockIdx.y
 	int x_i;
 	float minimum, maximum, val;
+
+	if(!d_is_branch_node[blockIdx.x]){
+		return;
+	}
 
 	minimum = FLT_MAX;
 	maximum = -FLT_MAX;
@@ -401,17 +447,23 @@ __global__ void kernel_collect_min_max(float* d_x_T, int* d_batch_pos, int desir
 	}
 }
 void collect_min_max(float* d_x_T, int* d_batch_pos, int desired_pos, int num_trees, int x_length,
-					 float* d_min_max_buffer, cudaDeviceProp dev_prop){
+					 float* d_min_max_buffer, int* d_is_branch_node, cudaDeviceProp dev_prop){
 	// Ripe for optimization.
 	dim3 grid(num_trees, FEATURE);
 	kernel_collect_min_max<<<grid, 64, 64 * sizeof(int) * 2>>>(
-		d_x_T, d_batch_pos, desired_pos, num_trees, x_length, d_min_max_buffer
+		d_x_T, d_batch_pos, desired_pos, num_trees, x_length, d_min_max_buffer, d_is_branch_node
 	);	
 }
-__global__ void kernel_collect_num_valid_feat(int* d_num_valid_feat, float* d_min_max_buffer, int num_trees){
+__global__ void kernel_collect_num_valid_feat(
+			int* d_num_valid_feat, float* d_min_max_buffer, int num_trees, int* d_is_branch_node
+		){
 	extern __shared__ int shared_num_valid_feat_buffer[];
 	// blockIdx.x = tree_id
 	int sub_num_valid_feat, feat_i;
+	if(!d_is_branch_node[blockIdx.x]){
+		return;
+	}
+
 	sub_num_valid_feat = 0;
 	for(feat_i=threadIdx.x; feat_i<FEATURE; feat_i+=blockDim.x){
 		if(d_min_max_buffer[ixt(feat_i, 0, blockIdx.x, 2, FEATURE)] != 
@@ -431,26 +483,37 @@ __global__ void kernel_collect_num_valid_feat(int* d_num_valid_feat, float* d_mi
 	   d_num_valid_feat[blockIdx.x] = shared_num_valid_feat_buffer[0];
 	}
 }
-void collect_num_valid_feat(int* d_num_valid_feat, float* d_min_max_buffer, int num_trees, cudaDeviceProp dev_prop){
+void collect_num_valid_feat(
+			int* d_num_valid_feat, float* d_min_max_buffer, int num_trees, int* d_is_branch_node, 
+			cudaDeviceProp dev_prop
+		){
 	// Ripe for optimization
 	int block_size = MIN(dev_prop.maxThreadsPerBlock, next_pow_2(FEATURE)); // Copy this to other places too
 	kernel_collect_num_valid_feat<<<num_trees, block_size, block_size * sizeof(int)>>>(
-		d_num_valid_feat, d_min_max_buffer, num_trees
+		d_num_valid_feat, d_min_max_buffer, num_trees, d_is_branch_node
 	);
 }
 
 /* === Populate Random Features === */
-__global__ void kernel_depopulate_valid_feat_idx(int* d_random_feats, int num_trees, int feat_per_node){
+__global__ void kernel_depopulate_valid_feat_idx(
+			int* d_random_feats, int num_trees, int feat_per_node
+		){
 	int t;
 	for(t=0; t<num_trees; t++){
 		//-1 means fill-forward
 		d_random_feats[index(t, threadIdx.x, feat_per_node)] = -1;
 	}
 }
-__global__ void kernel_populate_valid_feat_idx(int* d_random_feats, int* d_num_valid_feat, int feat_per_node, 
-	                         				   curandState_t* curand_states){
+__global__ void kernel_populate_valid_feat_idx(
+			int* d_random_feats, int* d_num_valid_feat, int feat_per_node, int* d_is_branch_node, 
+			curandState_t* curand_states
+		){
 	// threadIdx.x = tree_id
 	int k, idx, draw, num_valid_feat;
+	if(!d_is_branch_node[threadIdx.x]){
+		return;
+	}
+
 	idx = 0;
 	num_valid_feat = d_num_valid_feat[threadIdx.x];
 	for(k=0; k<(num_valid_feat-1); k++){
@@ -467,12 +530,17 @@ __global__ void kernel_populate_valid_feat_idx(int* d_random_feats, int* d_num_v
 		d_random_feats[index(threadIdx.x, idx, feat_per_node)] = k;
 	}
 }
-__global__ void kernel_populate_feat_cut(int* d_random_feats, float* d_random_cuts,
-										 float* d_min_max_buffer, int feat_per_node,
-										 int num_trees, curandState_t* curand_states){
+__global__ void kernel_populate_feat_cut(
+			int* d_random_feats, float* d_random_cuts,
+			float* d_min_max_buffer, int feat_per_node,
+			int num_trees, int* d_is_branch_node, curandState_t* curand_states
+		){
 	// threadIdx.x = tree_id
 	int feat_i, feat_idx, feat_idx_idx, valid_feats_seen, buffer;
 	float minimum, maximum;
+	if(!d_is_branch_node[threadIdx.x]){
+		return;
+	}
 	feat_idx = -1; // First element will overwrite
 	feat_idx_idx = 0; // Parallel construction
 	valid_feats_seen = 0;
@@ -500,18 +568,23 @@ __global__ void kernel_populate_feat_cut(int* d_random_feats, float* d_random_cu
 		valid_feats_seen++;
 	}
 }
-void populate_valid_feat_idx(int* d_random_feats, int* d_num_valid_feat, int feat_per_node, int num_trees,
-							 curandState_t* curand_states){
-	kernel_depopulate_valid_feat_idx<<<1, feat_per_node>>>(d_random_feats, num_trees, feat_per_node);
+void populate_valid_feat_idx(
+			int* d_random_feats, int* d_num_valid_feat, int feat_per_node, int num_trees, 
+			int* d_is_branch_node, curandState_t* curand_states
+		){
+	kernel_depopulate_valid_feat_idx<<<1, feat_per_node>>>(
+		d_random_feats, num_trees, feat_per_node);
 	kernel_populate_valid_feat_idx<<<1, num_trees>>>(
-		d_random_feats, d_num_valid_feat, feat_per_node, curand_states
+		d_random_feats, d_num_valid_feat, feat_per_node, 
+		d_is_branch_node, curand_states
 	);
 }
 void populate_feat_cut(int* d_random_feats, float* d_random_cuts,
 	 				   float* d_min_max_buffer, int feat_per_node,
-	 				   int num_trees, curandState_t* curand_states){
+	 				   int num_trees, int* d_is_branch_node, curandState_t* curand_states){
 	kernel_populate_feat_cut<<<1, num_trees>>>(
-		d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, curand_states
+		d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, 
+		d_is_branch_node, curand_states
 	);
 }
 
@@ -520,12 +593,15 @@ __global__ void kernel_populate_class_counts(
 		float* d_x, float* d_y, int* d_class_counts_a, int* d_class_counts_b, 
 		int* d_random_feats, float* d_random_cuts,
 		int* d_batch_pos, int tree_pos,
-		int num_trees, int feat_per_node
+		int num_trees, int feat_per_node, int* d_is_branch_node
 	){
 	// Naive version
 	// threadIdx.x = tree_id, blockIdx.x = rand_feat_i
 	int i, y, feat;
 	float cut;
+	if(!d_is_branch_node[threadIdx.x]){
+		return;
+	}
 	feat = d_random_feats[index(threadIdx.x, blockIdx.x, feat_per_node)];
 	cut = d_random_cuts[index(threadIdx.x, blockIdx.x, feat_per_node)];
 	for(i=0; i<NUMBER_OF_CLASSES; i++){
@@ -548,14 +624,15 @@ void populate_class_counts(
 		float* d_x, float* d_y, int* d_class_counts_a, int* d_class_counts_b, 
 		int* d_random_feats, float* d_random_cuts,
 		int* d_batch_pos, int tree_pos,
-		int num_trees, int feat_per_node
+		int num_trees, int feat_per_node, int* d_is_branch_node
 	){
 	// Naive version
 	kernel_populate_class_counts<<<feat_per_node, num_trees>>>(
 		d_x, d_y, d_class_counts_a, d_class_counts_b, 
 		d_random_feats, d_random_cuts,
 		d_batch_pos, tree_pos,
-		num_trees, feat_per_node
+		num_trees, feat_per_node,
+		d_is_branch_node
 	);
 }
 
@@ -564,7 +641,7 @@ __global__ void kernel_place_best_feat_cuts(
 		int* d_class_counts_a, int* d_class_counts_b, 
 		int* d_random_feats, float* d_random_cuts,
 		int* d_best_feats, float* d_best_cuts,
-		int feat_per_node, int num_trees
+		int feat_per_node, int num_trees, int* d_is_branch_node
 	){
 	// Naive version => Can move class_counts into shared memory
 	// threadIdx.x = tree_id
@@ -573,6 +650,10 @@ __global__ void kernel_place_best_feat_cuts(
     int best_feat;
     int total_a, total_b;
     float impurity_a, impurity_b;
+
+	if(!d_is_branch_node[threadIdx.x]){
+		return;
+	}
 
     best_improvement = -FLT_MAX;
     best_feat = -1;
@@ -604,25 +685,31 @@ void place_best_feat_cuts(
 		int* d_class_counts_a, int* d_class_counts_b, 
 		int* d_random_feats, float* d_random_cuts,
 		int* d_best_feats, float* d_best_cuts,
-		int feat_per_node, int num_trees
+		int feat_per_node, int num_trees, int* d_is_branch_node
 	){
 	// Naive version
 	kernel_place_best_feat_cuts<<<1, num_trees>>>(
 		d_class_counts_a, d_class_counts_b, 
 		d_random_feats, d_random_cuts,
 		d_best_feats, d_best_cuts,
-		feat_per_node, num_trees
+		feat_per_node, num_trees,
+		d_is_branch_node
 	);
 }
 
 /* === Update Trees === */
 __global__ void kernel_update_trees(
 			float* d_trees, int* d_tree_lengths, int tree_pos,
-			int* d_best_feats, float* d_best_cuts, int tree_arr_length
+			int* d_best_feats, float* d_best_cuts, int tree_arr_length, int* d_is_branch_node
 		){
 	// Naive version
 	// threadIdx.x = tree_id
 	int left_child_pos, right_child_pos, tree_length;
+
+	if(!d_is_branch_node[threadIdx.x]){
+		return;
+	}
+
 	tree_length = d_tree_lengths[threadIdx.x];
 	left_child_pos = tree_length;
 	right_child_pos = tree_length + 1;
@@ -637,15 +724,15 @@ __global__ void kernel_update_trees(
 	// Prefill child nodes
 	d_trees[ixt(left_child_pos, LEFT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = left_child_pos;
 	d_trees[ixt(left_child_pos, RIGHT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = left_child_pos;
-	d_trees[ixt(left_child_pos, RIGHT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = \
+	d_trees[ixt(left_child_pos, DEPTH_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = \
 		d_trees[ixt(tree_pos, DEPTH_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] + 1;
 	d_trees[ixt(left_child_pos, FEAT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = -1;
 	d_trees[ixt(left_child_pos, CUT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = -1;
 	d_trees[ixt(left_child_pos, PRED_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = -1;
 
-	d_trees[ixt(right_child_pos, LEFT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = left_child_pos;
-	d_trees[ixt(right_child_pos, RIGHT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = left_child_pos;
-	d_trees[ixt(right_child_pos, RIGHT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = \
+	d_trees[ixt(right_child_pos, LEFT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = right_child_pos;
+	d_trees[ixt(right_child_pos, RIGHT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = right_child_pos;
+	d_trees[ixt(right_child_pos, DEPTH_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = \
 		d_trees[ixt(tree_pos, DEPTH_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] + 1;
 	d_trees[ixt(right_child_pos, FEAT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = -1;
 	d_trees[ixt(right_child_pos, CUT_KEY, threadIdx.x, NUM_FIELDS, tree_arr_length)] = -1;
@@ -654,11 +741,11 @@ __global__ void kernel_update_trees(
 void update_trees(
 			float* d_trees, int* d_tree_lengths, int tree_pos,
 			int* d_best_feats, float* d_best_cuts, int tree_arr_length,
-				int num_trees
+			int num_trees, int* d_is_branch_node
 		){
 	kernel_update_trees<<<1, num_trees>>>(
 		d_trees, d_tree_lengths, tree_pos,
-		d_best_feats, d_best_cuts, tree_arr_length
+		d_best_feats, d_best_cuts, tree_arr_length, d_is_branch_node
 	);
 }
 
@@ -703,18 +790,18 @@ int main(int argc,char *argv[])
 	curandState_t* curand_states;
 
 	int num_trees;
-	num_trees = 5;
+	num_trees = 1;
 	// Assumption: num_trees < maxNumBlocks, maxThreadsPerBlock
 	srand(2);
 
 	tree_arr_length = (int *)malloc(sizeof(int));
 	tree_lengths = (int *)malloc(num_trees * sizeof(int));
-	*tree_arr_length = 1024;
+	*tree_arr_length = 8;
 	max_tree_length = (int *)malloc(sizeof(int));
 
 	feat_per_node = (int) ceil(sqrt(FEATURE));
 
-	trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
+	//trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
 	batch_pos = (int *)malloc(num_trees * TRAIN_NUM *sizeof(float));
 	is_branch_node = (int *)malloc(num_trees * sizeof(int));
 	tree_is_done = (int *)malloc(num_trees * sizeof(int));
@@ -759,11 +846,42 @@ int main(int argc,char *argv[])
 	initialize_trees(d_trees, num_trees, *tree_arr_length, d_tree_lengths);
 	initialize_batch_pos(d_batch_pos, TRAIN_NUM, num_trees, dev_prop);
 
-	for(tree_pos=0; tree_pos<2; tree_pos++){
+	for(tree_pos=0; tree_pos<200; tree_pos++){
 		printf("* ================== TREE POS -[ %d ]- ================== *\n", tree_pos);
+
+		trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
+		cudaMemcpy(trees, d_trees, num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float), cudaMemcpyDeviceToHost);
+		printf("%d\n", num_trees * NUM_FIELDS * (*tree_arr_length));
+		for(int i=0; i<num_trees; i++){
+			printf("T=%d    ", i);
+			for(int j=0; j<=10; j++){
+				printf("%d ", (int) trees[ixt(j, LEFT_KEY, i, NUM_FIELDS, *tree_arr_length)]);
+			}
+			printf("\n       ");
+			for(int j=0; j<=10; j++){
+				printf("%d ", (int) trees[ixt(j, RIGHT_KEY, i, NUM_FIELDS, *tree_arr_length)]);
+			}
+			printf("\n");
+		}
+		free(trees);
 		refresh_tree_is_done(d_tree_lengths, d_tree_is_done, tree_pos, num_trees);
-		maybe_expand(d_trees, num_trees, tree_arr_length, d_tree_lengths, max_tree_length, d_max_tree_length);
+		if(check_forest_done(d_tree_is_done, tree_is_done, num_trees)){
+			printf("DONE\n");
+			break;
+		}
+
+		maybe_expand(&d_trees, num_trees, tree_arr_length, d_tree_lengths, max_tree_length, d_max_tree_length);
 		batch_advance_trees(d_trees, d_x, TRAIN_NUM, *tree_arr_length, num_trees, d_batch_pos, dev_prop);
+
+		cudaMemcpy(batch_pos, d_batch_pos, num_trees * TRAIN_NUM * sizeof(float), cudaMemcpyDeviceToHost);
+		for(int i=0; i<num_trees; i++){
+			//printf("T=%d traverse\n", i);
+			for(int j=0; j<TRAIN_NUM; j++){
+				//printf("%d ", batch_pos[index(i, j, TRAIN_NUM)]);
+			}
+			//printf("\n");
+		}
+
 		check_node_termination(
 			d_trees, *tree_arr_length, 
 			d_y, d_batch_pos, tree_pos,
@@ -780,22 +898,16 @@ int main(int argc,char *argv[])
 		for(int i=0; i<num_trees; i++){printf("%d ", is_branch_node[i]);};printf("\n");
 		// VV
 
-		/*
-		cudaMemcpy(batch_pos, d_batch_pos, num_trees * TRAIN_NUM * sizeof(float), cudaMemcpyDeviceToHost);
-		for(int i=0; i<num_trees; i++){
-			for(int j=0; j<TRAIN_NUM; j++){
-				printf("%d ", batch_pos[index(i, j, TRAIN_NUM)]);
-			}
-			printf("\n");
-		}
-		*/
-
-		collect_min_max(d_x_T, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
-						d_min_max_buffer, dev_prop);
-		collect_num_valid_feat(
-			d_num_valid_feat, d_min_max_buffer, num_trees, dev_prop
+		collect_min_max(
+			d_x_T, d_batch_pos, tree_pos, num_trees, TRAIN_NUM,
+			d_min_max_buffer, d_is_branch_node, dev_prop
 		);
-		populate_valid_feat_idx(d_random_feats, d_num_valid_feat, feat_per_node, num_trees, curand_states);
+		collect_num_valid_feat(
+			d_num_valid_feat, d_min_max_buffer, num_trees, d_is_branch_node, dev_prop
+		);
+		populate_valid_feat_idx(
+			d_random_feats, d_num_valid_feat, feat_per_node, num_trees, d_is_branch_node, curand_states
+		);
 
 		// AAAA
 		/*
@@ -810,26 +922,29 @@ int main(int argc,char *argv[])
 		// ZZZZ
 
 		populate_feat_cut(
-			d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, curand_states
+			d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, 
+			d_is_branch_node, curand_states
 		);
 		populate_class_counts(
 			d_x, d_y, d_class_counts_a, d_class_counts_b, 
 			d_random_feats, d_random_cuts,
 			d_batch_pos, tree_pos,
-			num_trees, feat_per_node
+			num_trees, feat_per_node, 
+			d_is_branch_node
 		);
 		place_best_feat_cuts(
 			d_class_counts_a, d_class_counts_b, 
 			d_random_feats, d_random_cuts,
 			d_best_feats, d_best_cuts,
-			feat_per_node, num_trees
+			feat_per_node, num_trees, 
+			d_is_branch_node
 		);
 		update_trees(
 			d_trees, d_tree_lengths, tree_pos,
 			d_best_feats, d_best_cuts, *tree_arr_length,
-			num_trees
+			num_trees, 
+			d_is_branch_node
 		);
-
 		cudaMemcpy(random_feats, d_random_feats, num_trees * feat_per_node * sizeof(int), cudaMemcpyDeviceToHost);
 		cudaMemcpy(random_cuts, d_random_cuts, num_trees * feat_per_node * sizeof(float), cudaMemcpyDeviceToHost);
 		cudaMemcpy(class_counts_a, d_class_counts_a, num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int), cudaMemcpyDeviceToHost);
@@ -837,19 +952,24 @@ int main(int argc,char *argv[])
 		cudaMemcpy(best_feats, d_best_feats, num_trees *  sizeof(int), cudaMemcpyDeviceToHost);
 		cudaMemcpy(best_cuts, d_best_cuts, num_trees *  sizeof(float), cudaMemcpyDeviceToHost);
 
+		int x1;
 		for(int i=0; i<num_trees; i++){
 			printf("T=%d\n", i);
+			x1 = 0;
 			for(int j=0; j<feat_per_node; j++){
 				printf("  J=%d  @ %d---%f\n", j, random_feats[index(i, j, feat_per_node)], random_cuts[index(i, j, feat_per_node)]);
 				printf("    ");
 				for(int k=0; k<NUMBER_OF_CLASSES; k++){
+					x1 += class_counts_a[ixt(i, j, k, feat_per_node, num_trees)];
 					printf(" %d", class_counts_a[ixt(i, j, k, feat_per_node, num_trees)]);
 				}
 				printf("\n");
 				printf("    ");
 				for(int k=0; k<NUMBER_OF_CLASSES; k++){
+					x1 += class_counts_b[ixt(i, j, k, feat_per_node, num_trees)];
 					printf(" %d", class_counts_b[ixt(i, j, k, feat_per_node, num_trees)]);
 				}
+				printf("   ===>   %d", x1);
 				printf("\n");
 			}
 			printf("\n");
@@ -881,5 +1001,5 @@ int main(int argc,char *argv[])
 		*/
 
 	printf("\n");
-	debug(0);
+	debug();
 }
