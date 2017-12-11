@@ -794,55 +794,41 @@ int main(int argc, char * argv[])
 	dataset_train_T = (float *)malloc(TRAIN_NUM * FEATURE * sizeof(float));
 	copy_transpose(dataset_train_T, dataset_train, TRAIN_NUM, FEATURE);
 
-	float *trees, *d_trees;
+	float *d_trees;
 	int *tree_arr_length;
-	int *tree_lengths, *d_tree_lengths;
+	int *d_tree_lengths;
 	int *max_tree_length, *d_max_tree_length;
 	int feat_per_node;
-	int *num_valid_feat, *d_num_valid_feat;
+	int *d_num_valid_feat;
 	int tree_pos;
 	int *batch_pos, *d_batch_pos; // NUM_TREES * TRAIN_NUM
-	int *is_branch_node, *d_is_branch_node;
+	int *d_is_branch_node;
 	int *tree_is_done, *d_tree_is_done;
-	float *min_max_buffer, *d_min_max_buffer;
-	int *random_feats, *d_random_feats;
-	float *random_cuts, *d_random_cuts;
-	int *class_counts_a, *class_counts_b;
+	float *d_min_max_buffer;
+	int *d_random_feats;
+	float *d_random_cuts;
 	int *d_class_counts_a, *d_class_counts_b;
-	int *best_feats, *d_best_feats;
-	float *best_cuts, *d_best_cuts;
+	int *d_best_feats;
+	float *d_best_cuts;
 	float *d_x, *d_y;
 	float *d_x_T;
 	float *pred_y, *raw_pred_y, *d_raw_pred_y;
 	curandState_t* curand_states;
 
 	int num_trees;
-	num_trees = 10;
+	num_trees = 20;
 	// Assumption: num_trees < maxNumBlocks, maxThreadsPerBlock
 	srand(2);
 
 	tree_arr_length = (int *)malloc(sizeof(int));
-	tree_lengths = (int *)malloc(num_trees * sizeof(int));
 	*tree_arr_length = 8;
 	max_tree_length = (int *)malloc(sizeof(int));
 
 	feat_per_node = (int) ceil(sqrt(FEATURE));
 
-	//trees = (float *)malloc(num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
 	batch_pos = (int *)malloc(num_trees * TRAIN_NUM *sizeof(float));
-	is_branch_node = (int *)malloc(num_trees * sizeof(int));
 	tree_is_done = (int *)malloc(num_trees * sizeof(int));
-	min_max_buffer = (float *)malloc(num_trees * FEATURE * 2 *sizeof(float));
 	
-	num_valid_feat = (int *)malloc(num_trees * sizeof(int));
-	random_feats = (int *)malloc(num_trees * feat_per_node * sizeof(int));
-	random_cuts = (float *)malloc(num_trees * feat_per_node * sizeof(float));
-
-	best_feats = (int *)malloc(num_trees * sizeof(int));
-	best_cuts = (float *)malloc(num_trees * sizeof(float));
-
-	class_counts_a = (int *)malloc(num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int));
-	class_counts_b = (int *)malloc(num_trees * feat_per_node * NUMBER_OF_CLASSES *sizeof(int));
 	cudaDeviceProp dev_prop;
 	cudaGetDeviceProperties(&dev_prop, 0);
 	cudaMalloc((void **) &d_trees, num_trees * NUM_FIELDS * (*tree_arr_length) *sizeof(float));
@@ -903,8 +889,6 @@ int main(int argc, char * argv[])
 		populate_valid_feat_idx(
 			d_random_feats, d_num_valid_feat, feat_per_node, num_trees, d_is_branch_node, curand_states
 		);
-		cudaMemcpy(random_feats, d_random_feats, num_trees * feat_per_node * sizeof(int), 
-			cudaMemcpyDeviceToHost);
 		populate_feat_cut(
 			d_random_feats, d_random_cuts, d_min_max_buffer, feat_per_node, num_trees, 
 			d_is_branch_node, curand_states
